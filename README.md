@@ -136,7 +136,7 @@ Results are saved to `results.json`. Visualization is saved to `demo_video_resul
 ```bibtex
 @article{wang2026omnishotcut,
   title={OmniShotCut: Holistic Relational Shot Boundary Detection with Shot-Query Transformer},
-  author={Wang, Boyang and Xu, Guangyi and Tang, Zhipeng and Zhang, Jiahui and Cheng, Zezhou},
+  author={Wang, Boyang and Xu, Guangyi and Zhang, Jiahui and Tang, Zhipeng and Cheng, Zezhou},
   journal={arXiv preprint arXiv:2604.24762},
   year={2026}
 }
