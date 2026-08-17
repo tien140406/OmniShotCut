@@ -26,7 +26,7 @@ class OmniShotCutModel:
         self.last_inference_stats: dict[str, object] = {}
 
     def inference(self, video, mode="clean_shot", overlap=20, decoder_backend="auto",
-                  prefetch_windows=3):
+                  prefetch_windows=3, preprocess_device="cpu"):
         """Run shot cut detection on a video.
 
         Args:
@@ -43,6 +43,8 @@ class OmniShotCutModel:
                   the legacy decoder explicitly; "nvdec" requires NVDEC.
             prefetch_windows: number of decoded model windows buffered while
                   CUDA inference runs. This overlaps video decode and inference.
+            preprocess_device: "cuda" performs validation preprocessing on the
+                  GPU. "cpu" retains the legacy preprocessing path.
 
         Returns:
             ranges:       list of [start_frame, end_frame]
@@ -53,6 +55,7 @@ class OmniShotCutModel:
             ranges, intra_labels, inter_labels, stats = streaming_video_inference(
                 video, self._model, self._model_args, overlap,
                 decoder_backend=decoder_backend, prefetch_windows=prefetch_windows,
+                preprocess_device=preprocess_device,
             )
             self.last_inference_stats = stats
             if mode == "clean_shot":

@@ -169,6 +169,13 @@ class Video_Augmentation_Transform:
         x = _to_4d_video_tensor(frames)  # [T, C, H, W] in float
         Tt, C, H, W = x.shape
 
+        # Validation/inference has no augmentation.  Normalize the whole video
+        # tensor at once instead of entering the Python per-frame loop below.
+        # ``F.normalize`` supports leading batch dimensions, so this is
+        # numerically equivalent to normalizing each ``x[t]`` individually.
+        if self.set_type != "train":
+            return F.normalize(x, mean=self.mean, std=self.std)
+
 
         # Decide the prob
         if self.set_type == "train":

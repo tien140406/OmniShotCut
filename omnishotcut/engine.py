@@ -1,7 +1,7 @@
 '''
     This file is to inference arbitrary video files for Shot Cut
 '''
-import os, sys, shutil
+import os, sys, shutil, time
 import argparse
 from queue import Empty, Full, Queue
 import subprocess
@@ -28,6 +28,28 @@ from omnishotcut.label_correspondence import unique_intra_label_mapping, unique_
 
 # Video Transform
 video_transform = Video_Augmentation_Transform(set_type = "val")
+
+
+def _prepare_inference_video(video_np: np.ndarray, preprocess_device: str) -> torch.Tensor:
+    """Convert an RGB uint8 video window into the model input tensor.
+
+    Validation has no random augmentation.  Doing conversion and ImageNet
+    normalization on CUDA avoids the CPU-side per-frame transform that can
+    otherwise consume all host cores before every model forward pass.
+    """
+    if preprocess_device == "cpu":
+        return video_transform(video_np).unsqueeze(0).to("cuda")
+    if preprocess_device != "cuda":
+        raise ValueError(f"Unsupported preprocess device: {preprocess_device}")
+
+    # FFmpeg returns NHWC uint8 frames. Transfer them once, then convert and
+    # normalize vectorially on the same CUDA device as the model.
+    frames = torch.from_numpy(np.ascontiguousarray(video_np)).to("cuda")
+    frames = frames.permute(0, 3, 1, 2).contiguous().to(dtype=torch.float32)
+    frames.div_(255.0)
+    mean = torch.as_tensor(video_transform.mean, device=frames.device, dtype=frames.dtype).view(1, 3, 1, 1)
+    std = torch.as_tensor(video_transform.std, device=frames.device, dtype=frames.dtype).view(1, 3, 1, 1)
+    return frames.sub_(mean).div_(std).unsqueeze(0)
 
 
 def _ffmpeg_executable() -> str:
@@ -208,7 +230,8 @@ def _iter_prefetched_windows(*args, prefetch_windows: int, **kwargs):
 
 
 def streaming_video_inference(video_path, model, model_args, overlap_window_length,
-                              decoder_backend="auto", prefetch_windows=3):
+                              decoder_backend="auto", prefetch_windows=3,
+                              preprocess_device="cpu"):
     """Run shot detection while decoding ahead instead of materializing the full video.
 
     Window boundaries, overlap, padding and model preprocessing match the legacy
@@ -221,14 +244,24 @@ def streaming_video_inference(video_path, model, model_args, overlap_window_leng
     frame_count = 0
     active_backend = "cpu"
     fallback_reason = None
+    preprocess_seconds = 0.0
+    forward_seconds = 0.0
+    postprocess_seconds = 0.0
     for (video_np, _num_pad, window_start, valid_start, valid_end, valid_len,
          active_backend, fallback_reason) in _iter_prefetched_windows(
              video_path, width, height, chunk_size, overlap_window_length,
              backend=decoder_backend, prefetch_windows=prefetch_windows):
         frame_count = max(frame_count, window_start + valid_len)
-        video_tensor = video_transform(video_np).unsqueeze(0).to("cuda")
+        started = time.perf_counter()
+        video_tensor = _prepare_inference_video(video_np, preprocess_device)
+        torch.cuda.synchronize()
+        preprocess_seconds += time.perf_counter() - started
+        started = time.perf_counter()
         with torch.inference_mode():
             outputs = model(video_tensor)
+        torch.cuda.synchronize()
+        forward_seconds += time.perf_counter() - started
+        started = time.perf_counter()
         intra = outputs['intra_clip_logits'].softmax(-1)[0, :, :-1].argmax(dim=-1)
         inter = outputs['inter_clip_logits'].softmax(-1)[0, :, :-1].argmax(dim=-1)
         ranges = outputs['pred_shot_logits'].softmax(-1)[0, :, :-1].argmax(dim=-1)
@@ -248,6 +281,7 @@ def streaming_video_inference(video_path, model, model_args, overlap_window_leng
             if end_local >= valid_len:
                 break
         predictions = merge_predictions(predictions, window_predictions)
+        postprocess_seconds += time.perf_counter() - started
 
     ranges_out, intra_out, inter_out = [], [], []
     start_frame = 0
@@ -263,6 +297,10 @@ def streaming_video_inference(video_path, model, model_args, overlap_window_leng
         "decode_backend": active_backend,
         "decode_fallback_reason": fallback_reason,
         "prefetch_windows": max(1, prefetch_windows),
+        "preprocess_device": preprocess_device,
+        "preprocess_seconds": round(preprocess_seconds, 3),
+        "model_forward_seconds": round(forward_seconds, 3),
+        "postprocess_seconds": round(postprocess_seconds, 3),
         "decoded_frame_count": frame_count,
     }
     return ranges_out, intra_out, inter_out, stats
