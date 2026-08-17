@@ -10,7 +10,7 @@ logger.setLevel(logging.INFO)
 if not logger.handlers:
     logger.addHandler(logging.StreamHandler())
 
-from omnishotcut.engine import load_model, _run_on_numpy
+from omnishotcut.engine import load_model, _run_on_numpy, streaming_video_inference
 from omnishotcut.datasets.utils import _decode_video, _resize_video
 from omnishotcut.label_correspondence import unique_intra_label_mapping, intra_int2string, inter_int2string
 
@@ -23,8 +23,10 @@ class OmniShotCutModel:
     def __init__(self, model, model_args):
         self._model = model
         self._model_args = model_args
+        self.last_inference_stats: dict[str, object] = {}
 
-    def inference(self, video, mode="clean_shot", overlap=20):
+    def inference(self, video, mode="clean_shot", overlap=20, decoder_backend="auto",
+                  prefetch_windows=3):
         """Run shot cut detection on a video.
 
         Args:
@@ -36,6 +38,11 @@ class OmniShotCutModel:
             mode: "clean_shot" — general cuts only (no transitions)
                   "default"    — all detected shots with full labels
             overlap: number of overlap frames between adjacent inference windows
+            decoder_backend: "auto" uses NVDEC when supported, then safely
+                  falls back to the legacy FFmpeg CPU decoder. "cpu" preserves
+                  the legacy decoder explicitly; "nvdec" requires NVDEC.
+            prefetch_windows: number of decoded model windows buffered while
+                  CUDA inference runs. This overlaps video decode and inference.
 
         Returns:
             ranges:       list of [start_frame, end_frame]
@@ -43,7 +50,18 @@ class OmniShotCutModel:
             inter_labels: list of int (0=New_Start, 1=Hard_Cut, 2=Transition_Source, ...)
         """
         if isinstance(video, str):
-            video_np = _decode_video(video, self._model_args.process_width, self._model_args.process_height)
+            ranges, intra_labels, inter_labels, stats = streaming_video_inference(
+                video, self._model, self._model_args, overlap,
+                decoder_backend=decoder_backend, prefetch_windows=prefetch_windows,
+            )
+            self.last_inference_stats = stats
+            if mode == "clean_shot":
+                general_idx = unique_intra_label_mapping["general"]
+                keep = [i for i, lbl in enumerate(intra_labels) if lbl == general_idx]
+                return np.array(ranges)[keep].tolist() if keep else []
+            intra_labels = [intra_int2string.get(x, str(x)) for x in intra_labels]
+            inter_labels = [inter_int2string.get(x, str(x)) for x in inter_labels]
+            return ranges, intra_labels, inter_labels
         elif isinstance(video, torch.Tensor):
             if video.ndim != 4 or video.shape[-1] != 3:
                 raise ValueError(f"Tensor must be (T, H, W, 3), got {tuple(video.shape)}")
@@ -61,6 +79,7 @@ class OmniShotCutModel:
                     raise ValueError(f"Float array must be in [0, 1], got range [{video_np.min():.3f}, {video_np.max():.3f}]")
                 video_np = (video_np * 255).astype(np.uint8)
 
+        self.last_inference_stats = {"decode_backend": "numpy", "decoded_frame_count": len(video_np)}
         video_np = _resize_video(video_np, self._model_args.process_width, self._model_args.process_height)
 
         ranges, intra_labels, inter_labels = _run_on_numpy(video_np, self._model, self._model_args, overlap)

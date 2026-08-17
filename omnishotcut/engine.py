@@ -3,6 +3,9 @@
 '''
 import os, sys, shutil
 import argparse
+from queue import Empty, Full, Queue
+import subprocess
+import threading
 import numpy as np
 import copy
 import json
@@ -25,6 +28,244 @@ from omnishotcut.label_correspondence import unique_intra_label_mapping, unique_
 
 # Video Transform
 video_transform = Video_Augmentation_Transform(set_type = "val")
+
+
+def _ffmpeg_executable() -> str:
+    executable = shutil.which("ffmpeg")
+    if executable is None:
+        raise FileNotFoundError("ffmpeg was not found on PATH")
+    return executable
+
+
+def _nvdec_command(path: str, width: int, height: int) -> list[str]:
+    """Build an FFmpeg command that decodes and downscales on NVIDIA hardware.
+
+    Only the already-small RGB frames are copied back to host memory.  This keeps
+    the CPU free for the model's preprocessing and for decoding another video.
+    """
+    return [
+        _ffmpeg_executable(), "-hide_banner", "-loglevel", "error",
+        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", path,
+        "-vf", f"scale_cuda={width}:{height}:format=nv12,hwdownload,format=nv12",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-vsync", "passthrough", "pipe:1",
+    ]
+
+
+def _cpu_decode_command(path: str, width: int, height: int) -> list[str]:
+    """Match the project's original FFmpeg raw RGB decoder."""
+    return [
+        _ffmpeg_executable(), "-hide_banner", "-loglevel", "error", "-i", path,
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
+        "-vsync", "passthrough", "pipe:1",
+    ]
+
+
+def _nvdec_is_available(path: str, width: int, height: int) -> tuple[bool, str]:
+    """Validate NVDEC once before beginning a long inference job."""
+    command = [
+        _ffmpeg_executable(), "-hide_banner", "-loglevel", "error",
+        "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", path,
+        "-vf", f"scale_cuda={width}:{height}:format=nv12,hwdownload,format=nv12",
+        "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+    ]
+    try:
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    if result.returncode == 0:
+        return True, ""
+    return False, result.stderr.decode("utf-8", "replace").strip()[-500:]
+
+
+def _decode_command(path: str, width: int, height: int, backend: str) -> tuple[list[str], str, str | None]:
+    """Choose a decoder, falling back to the original CPU path in auto mode."""
+    if backend not in {"auto", "cpu", "nvdec"}:
+        raise ValueError(f"Unsupported decoder backend: {backend}")
+    if backend == "cpu":
+        return _cpu_decode_command(path, width, height), "cpu", None
+    available, detail = _nvdec_is_available(path, width, height)
+    if available:
+        return _nvdec_command(path, width, height), "nvdec", None
+    if backend == "nvdec":
+        raise RuntimeError(f"NVDEC is unavailable for {path}: {detail}")
+    return _cpu_decode_command(path, width, height), "cpu", detail or "NVDEC unavailable"
+
+
+def _read_rgb_frame(stream, frame_bytes: int, height: int, width: int) -> np.ndarray | None:
+    data = stream.read(frame_bytes)
+    if not data:
+        return None
+    if len(data) != frame_bytes:
+        raise RuntimeError(f"FFmpeg produced a truncated frame ({len(data)}/{frame_bytes} bytes)")
+    return np.frombuffer(data, np.uint8).reshape(height, width, 3).copy()
+
+
+def _iter_decoded_windows(path: str, width: int, height: int, chunk_size: int, overlap: int,
+                          backend: str):
+    """Yield the same windows as ``split_videos`` without decoding the full video first."""
+    command, active_backend, fallback_reason = _decode_command(path, width, height, backend)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if process.stdout is None or process.stderr is None:
+        process.kill()
+        raise RuntimeError("Could not open FFmpeg pipes")
+    frame_bytes = width * height * 3
+    stride = chunk_size - overlap
+    left_overlap = overlap // 2
+    right_overlap = overlap - left_overlap
+    frames: list[np.ndarray] = []
+    window_start = 0
+    try:
+        while True:
+            while len(frames) < chunk_size:
+                frame = _read_rgb_frame(process.stdout, frame_bytes, height, width)
+                if frame is None:
+                    break
+                frames.append(frame)
+            if not frames:
+                break
+
+            final_window = len(frames) < chunk_size
+            if not final_window:
+                # Peek one frame so a full final window gets the same valid-end
+                # behavior as split_videos(), while non-final windows can proceed.
+                frame = _read_rgb_frame(process.stdout, frame_bytes, height, width)
+                if frame is None:
+                    final_window = True
+                else:
+                    frames.append(frame)
+
+            valid_len = min(chunk_size, len(frames))
+            video_chunk = np.stack(frames[:valid_len])
+            num_pad_frames = chunk_size - valid_len
+            if num_pad_frames:
+                video_chunk = np.concatenate((
+                    video_chunk,
+                    np.zeros((num_pad_frames, height, width, 3), dtype=np.uint8),
+                ))
+            valid_start = 0 if window_start == 0 else window_start + left_overlap
+            valid_end = (window_start + valid_len if final_window
+                         else window_start + chunk_size - right_overlap)
+            yield (video_chunk, num_pad_frames, window_start, valid_start, valid_end,
+                   valid_len, active_backend, fallback_reason)
+            if final_window:
+                break
+            del frames[:stride]
+            window_start += stride
+    finally:
+        process.stdout.close()
+        stderr = process.stderr.read().decode("utf-8", "replace")
+        returncode = process.wait()
+        if returncode:
+            raise RuntimeError(f"FFmpeg failed to decode: {path}\n{stderr[-2000:]}")
+
+
+def _iter_prefetched_windows(*args, prefetch_windows: int, **kwargs):
+    """Decode ahead on a background thread so FFmpeg and CUDA inference overlap."""
+    queue: Queue[object] = Queue(maxsize=max(1, prefetch_windows))
+    stop = threading.Event()
+    sentinel = object()
+
+    def put(item: object) -> bool:
+        while not stop.is_set():
+            try:
+                queue.put(item, timeout=0.1)
+                return True
+            except Full:
+                pass
+        return False
+
+    def producer() -> None:
+        windows = _iter_decoded_windows(*args, **kwargs)
+        try:
+            for window in windows:
+                if not put(window):
+                    return
+        except BaseException as exc:
+            put(exc)
+        finally:
+            windows.close()
+            put(sentinel)
+
+    thread = threading.Thread(target=producer, name="omnishotcut-decode", daemon=True)
+    thread.start()
+    try:
+        while True:
+            try:
+                item = queue.get(timeout=0.5)
+            except Empty:
+                if not thread.is_alive():
+                    raise RuntimeError("OmniShotCut decoder stopped without returning a result")
+                continue
+            if item is sentinel:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+
+
+def streaming_video_inference(video_path, model, model_args, overlap_window_length,
+                              decoder_backend="auto", prefetch_windows=3):
+    """Run shot detection while decoding ahead instead of materializing the full video.
+
+    Window boundaries, overlap, padding and model preprocessing match the legacy
+    ``single_video_inference`` implementation.  The memory footprint is bounded by
+    a few model windows and CPU decode can overlap CUDA inference.
+    """
+    chunk_size = model_args.max_process_window_length
+    height, width = model_args.process_height, model_args.process_width
+    predictions = []
+    frame_count = 0
+    active_backend = "cpu"
+    fallback_reason = None
+    for (video_np, _num_pad, window_start, valid_start, valid_end, valid_len,
+         active_backend, fallback_reason) in _iter_prefetched_windows(
+             video_path, width, height, chunk_size, overlap_window_length,
+             backend=decoder_backend, prefetch_windows=prefetch_windows):
+        frame_count = max(frame_count, window_start + valid_len)
+        video_tensor = video_transform(video_np).unsqueeze(0).to("cuda")
+        with torch.inference_mode():
+            outputs = model(video_tensor)
+        intra = outputs['intra_clip_logits'].softmax(-1)[0, :, :-1].argmax(dim=-1)
+        inter = outputs['inter_clip_logits'].softmax(-1)[0, :, :-1].argmax(dim=-1)
+        ranges = outputs['pred_shot_logits'].softmax(-1)[0, :, :-1].argmax(dim=-1)
+        start_local = 0
+        window_predictions = []
+        for keep_idx in range(len(intra)):
+            end_local = min(int(ranges[keep_idx].detach().cpu()), valid_len)
+            if start_local < end_local:
+                end_global = window_start + end_local
+                if valid_start < end_global <= valid_end:
+                    window_predictions.append({
+                        "end_frame_idx": int(end_global),
+                        "intra_label": int(intra[keep_idx].detach().cpu()),
+                        "inter_label": int(inter[keep_idx].detach().cpu()),
+                    })
+            start_local = end_local
+            if end_local >= valid_len:
+                break
+        predictions = merge_predictions(predictions, window_predictions)
+
+    ranges_out, intra_out, inter_out = [], [], []
+    start_frame = 0
+    for item in predictions:
+        end_frame = min(int(item["end_frame_idx"]), frame_count)
+        if end_frame <= start_frame:
+            continue
+        ranges_out.append([int(start_frame), int(end_frame)])
+        intra_out.append(int(item["intra_label"]))
+        inter_out.append(int(item["inter_label"]))
+        start_frame = end_frame
+    stats = {
+        "decode_backend": active_backend,
+        "decode_fallback_reason": fallback_reason,
+        "prefetch_windows": max(1, prefetch_windows),
+        "decoded_frame_count": frame_count,
+    }
+    return ranges_out, intra_out, inter_out, stats
 
 
 
